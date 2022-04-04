@@ -29,6 +29,22 @@ public readonly struct ApiDeclarationModel : IEquatable<ApiDeclarationModel>
         }
     }
 
+    public ObsoletionModel? Obsoletion
+    {
+        get
+        {
+            return _api.Catalog.GetObsoletion(_api.Id, Assembly.Id);
+        }
+    }
+
+    public IEnumerable<PlatformSupportModel> PlatformSupport
+    {
+        get
+        {
+            return _api.Catalog.GetPlatformSupport(_api.Id, Assembly.Id);
+        }
+    }
+
     private Markup GetMyMarkup()
     {
         var markupOffset = _api.Catalog.GetApiTableInt32(_offset + 4);

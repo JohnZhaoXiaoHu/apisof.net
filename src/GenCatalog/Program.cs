@@ -20,6 +20,8 @@ using NuGet.Versioning;
 
 namespace GenCatalog;
 
+// TODO: Add [Obsolete] and [SupportedOSPlatform] information to binary catalog
+
 internal static class Program
 {
     private static async Task<int> Main(string[] args)

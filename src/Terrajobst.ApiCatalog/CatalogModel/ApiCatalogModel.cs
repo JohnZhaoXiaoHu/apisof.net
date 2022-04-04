@@ -45,11 +45,8 @@ namespace Terrajobst.ApiCatalog;
 //       FrameworkOffsets
 //       PackageOffsets
 //   - Usage Sources
-//       Offsets
 //       NameOffset
-//       Usaget Data Sets
-//          SourceOffset
-//          Date
+//       Date
 //   - Apis
 //       Guid
 //       Kind
@@ -57,14 +54,14 @@ namespace Terrajobst.ApiCatalog;
 //       ParentOffset
 //       ChildrenOffsets
 //       (AssemblyOffset, SyntaxOffset)*
-//       (UsageDataSetOffset, Percentage)*
+//       (UsageSourceOffset, Percentage)*
 //       GetSyntax(AssemblyModel) -> binary searches by assembly offset
 //       GetPercentage(UsageDataSet) -> binary searches by data set offset
 
 public sealed partial class ApiCatalogModel
 {
     private static IReadOnlyList<byte> MagicHeader { get; } = Encoding.ASCII.GetBytes("APICATFB");
-    private const int FormatVersion = 2;
+    private const int FormatVersion = 3;
 
     private readonly int _sizeOnDisk;
     private readonly byte[] _buffer;
@@ -79,10 +76,14 @@ public sealed partial class ApiCatalogModel
     private readonly int _usageSourcesTableLength;
     private readonly int _apiTableOffset;
     private readonly int _apiTableLength;
+    private readonly int _obsoletionTableOffset;
+    private readonly int _obsoletionTableLength;
+    private readonly int _platformSupportTableOffset;
+    private readonly int _platformSupportTableLength;
 
     private ApiCatalogModel(int sizeOnDisk, byte[] buffer, int[] tableSizes)
     {
-        Debug.Assert(tableSizes.Length == 6);
+        Debug.Assert(tableSizes.Length == 8);
 
         _stringTableLength = tableSizes[0];
 
@@ -101,6 +102,12 @@ public sealed partial class ApiCatalogModel
         _apiTableOffset = _usageSourcesTableOffset + _usageSourcesTableLength;
         _apiTableLength = tableSizes[5];
 
+        _obsoletionTableOffset = _apiTableOffset + _apiTableLength;
+        _obsoletionTableLength = tableSizes[6];
+
+        _platformSupportTableOffset = _obsoletionTableOffset + _obsoletionTableLength;
+        _platformSupportTableLength = tableSizes[7];
+
         _buffer = buffer;
         _sizeOnDisk = sizeOnDisk;
     }
@@ -116,6 +123,10 @@ public sealed partial class ApiCatalogModel
     internal ReadOnlySpan<byte> UsageSourcesTable => new(_buffer, _usageSourcesTableOffset, _usageSourcesTableLength);
 
     internal ReadOnlySpan<byte> ApiTable => new(_buffer, _apiTableOffset, _apiTableLength);
+
+    internal ReadOnlySpan<byte> ObsoletionTable => new(_buffer, _obsoletionTableOffset, _obsoletionTableLength);
+
+    internal ReadOnlySpan<byte> PlatformSupportTable => new(_buffer, _platformSupportTableOffset, _platformSupportTableLength);
 
     public IEnumerable<FrameworkModel> Frameworks
     {
@@ -272,14 +283,117 @@ public sealed partial class ApiCatalogModel
         return BinaryPrimitives.ReadSingleLittleEndian(ApiTable.Slice(offset));
     }
 
-    public void Dump(string fileName)
+    private Dictionary<(int ApiId, int AssemblyId), int> _platforSupportOffsets;
+    private Dictionary<(int ApiId, int AssemblyId), int> _obsoletionOffsets;
+
+    private static int GetDeclarationTableOffset(ReadOnlySpan<byte> table, int rowSize, int apiId, int assemblyId)
     {
-        Console.WriteLine($"Size on disk    : {new FileInfo(fileName).Length,12:N0} bytes");
-        Console.WriteLine($"Size in memory  : {_buffer.Length,12:N0} bytes");
-        Console.WriteLine($"String table    : {_stringTableLength,12:N0} bytes");
-        Console.WriteLine($"Framework table : {_frameworkTableLength,12:N0} bytes");
-        Console.WriteLine($"Assembly table  : {_assemblyTableLength,12:N0} bytes");
-        Console.WriteLine($"API table       : {_apiTableLength,12:N0} bytes");
+        Debug.Assert((table.Length - 4) % rowSize == 0);
+
+        // TODO: Replace with binary search
+
+        for (var offset = 4; offset < table.Length; offset += rowSize)
+        {
+            var rowApiId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset));
+            var rowAssemblyId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset + 4));
+
+            if (rowApiId == apiId &&
+                rowAssemblyId == assemblyId)
+            {
+                return offset;
+            }
+        }
+
+        return -1;
+    }
+
+    internal ObsoletionModel? GetObsoletion(int apiId, int assemblyId)
+    {
+        // var obsoletionOffset = GetDeclarationTableOffset(ObsoletionTable, 21, apiId, assemblyId);
+        // return obsoletionOffset < 0 ? null : new ObsoletionModel(this, obsoletionOffset);
+        
+        // TODO: hack
+        
+        if (_obsoletionOffsets is null)
+        {
+            _obsoletionOffsets = new();
+
+            int lastApi = -1;
+            int lastAssembly = -1;
+
+            var table = ObsoletionTable;
+            var rowSize = 21;
+            
+            for (var offset = 4; offset < table.Length; offset += rowSize)
+            {
+                var rowApiId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset));
+                var rowAssemblyId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset + 4));
+
+                if (rowApiId != lastApi ||
+                    rowAssemblyId != lastAssembly)
+                {
+                    lastApi = rowApiId;
+                    lastAssembly = rowAssemblyId;
+                    _obsoletionOffsets[(rowApiId, rowAssemblyId)] = offset;
+                }
+            }
+        }
+
+        if (_obsoletionOffsets.TryGetValue((apiId, assemblyId), out var obsoletionOffset))
+            return new ObsoletionModel(this, obsoletionOffset);
+        else
+            return null;
+    }
+
+    internal IEnumerable<PlatformSupportModel> GetPlatformSupport(int apiId, int assemblyId)
+    {
+        //var platformSupportOffset = GetDeclarationTableOffset(PlatformSupportTable, 13, apiId, assemblyId);
+        //if (platformSupportOffset < 0)
+        //    yield break;
+
+        // TODO: remove hack
+
+        if (_platforSupportOffsets is null)
+        {
+            _platforSupportOffsets = new();
+
+            int lastApi = -1;
+            int lastAssembly = -1;
+
+            var table = PlatformSupportTable;
+            var rowSize = 13;
+
+            for (var offset = 4; offset < table.Length; offset += rowSize)
+            {
+                var rowApiId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset));
+                var rowAssemblyId = BinaryPrimitives.ReadInt32LittleEndian(table.Slice(offset + 4));
+
+                if (rowApiId != lastApi ||
+                    rowAssemblyId != lastAssembly)
+                {
+                    lastApi = rowApiId;
+                    lastAssembly = rowAssemblyId;
+                    _platforSupportOffsets[(rowApiId, rowAssemblyId)] = offset;
+                }
+            }
+        }
+
+        if (!_platforSupportOffsets.TryGetValue((apiId, assemblyId), out var platformSupportOffset))
+            yield break;
+
+        while (true)
+        {
+            var rowApiId = BinaryPrimitives.ReadInt32LittleEndian(PlatformSupportTable.Slice(platformSupportOffset));
+            var rowAssemblyId = BinaryPrimitives.ReadInt32LittleEndian(PlatformSupportTable.Slice(platformSupportOffset + 4));
+
+            if (rowApiId != apiId ||
+                rowAssemblyId != assemblyId)
+                yield break;
+
+            yield return new PlatformSupportModel(this, platformSupportOffset);
+
+            platformSupportOffset += 13;
+        }
     }
 
     public ApiCatalogStatistics GetStatistics()
