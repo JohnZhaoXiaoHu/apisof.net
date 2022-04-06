@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -10,9 +11,14 @@ public sealed class PlatformList
 {
     public static PlatformList Empty { get; } = new PlatformList(PlatformListKind.ExclusionList, new Dictionary<string, IReadOnlyList<(Version, bool)>>());
 
-    public static PlatformList ForSinglePlatform(string platform)
+    public static PlatformList Supported(string platform)
     {
         return For(new[] { (platform, true) });
+    }
+
+    public static PlatformList Supported(IEnumerable<string> platforms)
+    {
+        return For(platforms.Select(p => (p, true)));
     }
 
     public static PlatformList For(IEnumerable<PlatformSupportModel> platformSupport)
@@ -32,7 +38,7 @@ public sealed class PlatformList
     public static PlatformList For(IEnumerable<(string PlatformName, Version PlatformVersion, bool IsSupported)> platformSupport)
     {
         var versionsByName = platformSupport.GroupBy(ps => ps.PlatformName, ps => (ps.PlatformVersion, ps.IsSupported), StringComparer.OrdinalIgnoreCase)
-                                            .ToDictionary(g => g.Key, g => (IReadOnlyList<(Version Version, bool IsSupported)>) g.OrderBy(t => t.PlatformVersion).ToArray());
+                                            .ToDictionary(g => g.Key, g => (IReadOnlyList<(Version Version, bool IsSupported)>) g.OrderBy(t => t.PlatformVersion).ToArray(), StringComparer.OrdinalIgnoreCase);
 
         if (versionsByName.Count == 0)
             return Empty;
@@ -86,9 +92,14 @@ public sealed class PlatformList
     private PlatformList(PlatformListKind kind,
                          IReadOnlyDictionary<string, IReadOnlyList<(Version Version, bool IsSupported)>> platforms)
     {
+        Debug.Assert(platforms.All(kv => kv.Value.Count > 0));
+        Debug.Assert(platforms.Count > 0 || kind == PlatformListKind.ExclusionList);
+
         Kind = kind;
         _platforms = platforms;
     }
+
+    public bool IsUnlimited => _platforms.Count == 0;
 
     public PlatformListKind Kind { get; }
 
@@ -123,8 +134,130 @@ public sealed class PlatformList
         return Kind == PlatformListKind.InclusionList;
     }
 
+    public PlatformList Union(PlatformList other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+
+        return Kind == other.Kind
+                ? Kind == PlatformListKind.ExclusionList
+                    ? MergeExclusions(this, other)
+                    : MergeInclusions(this, other)
+                : Kind == PlatformListKind.ExclusionList
+                    ? MergeExclusionWithInclusion(this, other)
+                    : MergeExclusionWithInclusion(other, this);
+
+        static PlatformList MergeInclusions(PlatformList left, PlatformList right)
+        {
+            var result = left._platforms.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (k, rightV) in right._platforms)
+            {
+                if (!result.TryGetValue(k, out var leftV))
+                {
+                    result.Add(k, rightV);
+                }
+                else
+                {
+                    result[k] = Merge(leftV, rightV, true);
+                }
+            }
+
+            return new PlatformList(PlatformListKind.InclusionList, result);
+        }
+
+        static PlatformList MergeExclusions(PlatformList left, PlatformList right)
+        {
+            var result = new Dictionary<string, IReadOnlyList<(Version Version, bool IsSupported)>>(StringComparer.OrdinalIgnoreCase);
+            var commonKeys = left._platforms.Keys.Where(right._platforms.ContainsKey);
+
+            foreach (var k in commonKeys)
+            {
+                var leftV = left._platforms[k];
+                var rightV = left._platforms[k];
+                var mergedV = Merge(leftV, rightV, false);
+                result.Add(k, mergedV);
+            }
+
+            return new PlatformList(PlatformListKind.ExclusionList, result);
+        }
+
+        static PlatformList MergeExclusionWithInclusion(PlatformList exclusionList, PlatformList inclusionList)
+        {
+            var result = exclusionList._platforms.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (k, inclusionV) in inclusionList._platforms)
+            {
+                if (result.TryGetValue(k, out var exclusionV))
+                {
+                    var mergedV = Merge(exclusionV, inclusionV, false);
+                    result.Add(k, mergedV);
+                }
+            }
+
+            return new PlatformList(PlatformListKind.ExclusionList, result);
+        }
+
+        static IReadOnlyList<(Version Version, bool IsSupported)> Merge(IReadOnlyList<(Version Version, bool IsSupported)> left,
+                                                                        IReadOnlyList<(Version Version, bool IsSupported)> right,
+                                                                        bool startingIsSupported)
+        {
+            var result = new List<(Version Version, bool IsSupported)>(left.Count + right.Count);
+            var currentVersion = new Version(0, 0, 0, 0);
+            var currentIsSupported = startingIsSupported;
+
+            while (true)
+            {
+                var nextLeft = FindNext(left, currentVersion, currentIsSupported);
+                var nextRight = FindNext(right, currentVersion, currentIsSupported);
+
+                if (nextLeft is not null && nextRight is not null)
+                {
+                    currentVersion = Min(nextLeft, nextRight);
+                }
+                else if (nextLeft is not null)
+                {
+                    currentVersion = nextLeft;
+                }
+                else if (nextRight is not null)
+                {
+                    currentVersion = nextRight;
+                }
+                else
+                {
+                    break;
+                }
+
+                result.Add((currentVersion, currentIsSupported));
+                currentIsSupported = !currentIsSupported;
+            }
+
+            if (result.Count == 0)
+                result.Add((currentVersion, currentIsSupported));
+
+            Debug.Assert(result.Count > 0);
+
+            return result.ToArray();
+        }
+
+        static Version FindNext(IEnumerable<(Version Version, bool IsSupported)> source, Version version, bool isSupported)
+        {
+            return source.Where(t => t.Version > version && t.IsSupported == isSupported)
+                         .Select(t => t.Version)
+                         .DefaultIfEmpty()
+                         .Min();
+        }
+
+        static Version Min(Version left, Version right)
+        {
+            return left <= right ? left : right;
+        }
+    }
+
     public override string ToString()
     {
+        if (_platforms.Count == 0)
+            return "Supported everywhere.";
+
         var sb = new StringBuilder();
 
         if (Kind == PlatformListKind.InclusionList)
@@ -141,15 +274,21 @@ public sealed class PlatformList
             else
                 sb.Append(", ");
 
-            if (versions.Count == 1 && versions[0].Version == new Version(0, 0))
+            if (versions.Count == 1)
             {
                 sb.Append(platform);
+
+                if (versions[0].Version > new Version(0, 0, 0, 0))
+                {
+                    sb.Append(' ');
+                    sb.Append(versions[0].Version);
+                }
             }
             else
             {
                 var isFirstVersion = true;
 
-                foreach (var (version, isSupported) in versions)
+                foreach (var (version, _) in versions)
                 {
                     if (isFirstVersion)
                     {

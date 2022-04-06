@@ -52,7 +52,7 @@ public sealed class ApiAvailability
             }
         }
 
-        // Compute visibility
+        // Compute framework availability
 
         var frameworkAvailabilities = new List<ApiFrameworkAvailability>();
 

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 using NuGet.Frameworks;
@@ -18,7 +19,7 @@ public sealed class PlatformAvailability
 
     private static PlatformAvailability FrameworkLimited(FrameworkModel framework, string platformName)
     {
-        var platformList = PlatformList.ForSinglePlatform(platformName);
+        var platformList = PlatformList.Supported(platformName);
         return new PlatformAvailability(PlatformAvailabilityKind.FrameworkLimited, framework, platformList);
     }
 
@@ -32,6 +33,37 @@ public sealed class PlatformAvailability
     {
         var platformList = PlatformList.For(platformSupport);
         return new PlatformAvailability(PlatformAvailabilityKind.ApiLimited, api, platformList);
+    }
+
+    public static PlatformAvailability Create(ApiModel api)
+    {
+        // We don't want to associate platform information with namespaces, just members and containing types.
+        if (api.Kind == ApiKind.Namespace)
+            return null;
+
+        var frameworksByAssembly = api.Catalog.Frameworks.SelectMany(fx => fx.Assemblies, (fx, a) => (Framework: fx, Assembly: a))
+                                                         .ToLookup(t => t.Assembly, t => t.Framework);
+
+        var apiAvailability = ApiAvailability.Create(api);
+        var latestPlatformNeutralAnnotation = apiAvailability.Frameworks.Where(a => IsAnnotated(a.Framework) && !a.Framework.HasPlatform)
+                                                                        .MaxBy(a => a.Framework.Version);
+
+        if (latestPlatformNeutralAnnotation is not null)
+            return Create(latestPlatformNeutralAnnotation.Declaration);
+
+        var frameworkPlatforms = apiAvailability.Frameworks.Where(a => IsAnnotated(a.Framework) && a.Framework.HasPlatform)
+                                                           .Select(a => GetFrameworkPlatform(a.Framework))
+                                                           .Where(p => !string.IsNullOrEmpty(p))
+                                                           .Distinct()
+                                                           .ToArray();
+
+        if (frameworkPlatforms.Any())
+        {
+            var list = PlatformList.Supported(frameworkPlatforms);
+            return new PlatformAvailability(PlatformAvailabilityKind.ApiLimited, api, list);
+        }
+
+        return Unknown;
     }
 
     public static PlatformAvailability Create(ApiModel api, FrameworkModel framework)
@@ -51,7 +83,7 @@ public sealed class PlatformAvailability
             {
                 availability = Create(api, framework, frameworkAssemblies);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (!Debugger.IsAttached)
             {
                 Console.WriteLine($"error: {api.GetFullName()}: {ex.Message}");
                 continue;
@@ -63,41 +95,48 @@ public sealed class PlatformAvailability
 
     private static PlatformAvailability Create(ApiModel api, FrameworkModel framework, HashSet<AssemblyModel> frameworkAssemblies)
     {
-        // We don't want to associate platform information with namespaces, just members and containing types.
-        if (api.Kind == ApiKind.Namespace)
+        var declaration = api.Declarations.FirstOrDefault(d => frameworkAssemblies.Contains(d.Assembly));
+        if (declaration == default)
             return null;
 
-        if (!frameworkAssemblies.Overlaps(api.Declarations.Select(d => d.Assembly)))
-            return null;
+        return Create(declaration, framework);
+    }
 
-        var parsedFramework = NuGetFramework.Parse(framework.Name);
-        var frameworkPlatform = GetFrameworkPlatform(parsedFramework);
-        if (frameworkPlatform is not null)
-            return FrameworkLimited(framework, frameworkPlatform);
+    private static PlatformAvailability Create(ApiDeclarationModel declaration, FrameworkModel framework)
+    {
+        var annotatedAvailability = Create(declaration);
 
-        if (parsedFramework.Framework == ".NETStandard" ||
-            parsedFramework.Framework == ".NETCoreApp" && parsedFramework.Version < new Version(5, 0))
+        if (annotatedAvailability.Kind == PlatformAvailabilityKind.Unlimited)
         {
-            return Unknown;
+            var parsedFramework = NuGetFramework.Parse(framework.Name);
+
+            if (!IsAnnotated(parsedFramework))
+                return Unknown;
+
+            var frameworkPlatform = GetFrameworkPlatform(parsedFramework);
+            if (frameworkPlatform is not null)
+                return FrameworkLimited(framework, frameworkPlatform);
         }
 
-        var platformSupport = Enumerable.Empty<PlatformSupportModel>();
-        var limitationSource = (object)api;
+        return annotatedAvailability;
+    }
 
-        foreach (var a in api.AncestorsAndSelf())
+    public static PlatformAvailability Create(ApiDeclarationModel declaration)
+    {
+        // We don't want to associate platform information with namespaces, just members and containing types.
+        if (declaration.Api.Kind == ApiKind.Namespace)
+            return null;
+
+        foreach (var a in declaration.Api.AncestorsAndSelf())
         {
-            var declaration = a.Declarations.FirstOrDefault(d => frameworkAssemblies.Contains(d.Assembly));
-            if (declaration.PlatformSupport.Any())
+            var aDeclaration = a.Declarations.FirstOrDefault(d => d.Assembly == declaration.Assembly);
+            if (aDeclaration.PlatformSupport.Any())
                 return ApiLimited(a, declaration.PlatformSupport);
         }
 
-        if (!platformSupport.Any())
-        {
-            var declaration = api.Declarations.First(d => frameworkAssemblies.Contains(d.Assembly));
-            var assembly = declaration.Assembly;
-            if (assembly.PlatformSupport.Any())
-                return AssemblyLimited(assembly, assembly.PlatformSupport);
-        }
+        var assembly = declaration.Assembly;
+        if (assembly.PlatformSupport.Any())
+            return AssemblyLimited(assembly, assembly.PlatformSupport);
 
         return Unlimited;
     }
@@ -132,6 +171,12 @@ public sealed class PlatformAvailability
         return null;
     }
 
+    private static bool IsAnnotated(NuGetFramework framework)
+    {
+        return string.Equals(framework.Framework, ".NETCoreApp", StringComparison.OrdinalIgnoreCase) &&
+               framework.Version >= new Version(5, 0, 0, 0);
+    }
+
     private PlatformAvailability(PlatformAvailabilityKind kind,
                                  object limitationSource,
                                  PlatformList platformList)
@@ -146,6 +191,35 @@ public sealed class PlatformAvailability
     public object LimitationSource { get; }
 
     public PlatformList PlatformList { get; }
+
+    public PlatformAvailability Union(PlatformAvailability other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+
+        if (other.Kind == PlatformAvailabilityKind.Unknown)
+            return this;
+
+        if (other.Kind == PlatformAvailabilityKind.Unlimited)
+            return other;
+
+        switch (Kind)
+        {
+            case PlatformAvailabilityKind.Unknown:
+                return other;
+            case PlatformAvailabilityKind.Unlimited:
+                return this;
+            case PlatformAvailabilityKind.FrameworkLimited:
+            case PlatformAvailabilityKind.AssemblyLimited:
+            case PlatformAvailabilityKind.ApiLimited:
+                var list = PlatformList.Union(other.PlatformList);
+                var source = Kind == PlatformAvailabilityKind.ApiLimited ? LimitationSource : null;
+                return list.IsUnlimited
+                        ? Unlimited
+                        : new PlatformAvailability(PlatformAvailabilityKind.ApiLimited, source, list);
+            default:
+                throw new Exception($"Unknown kind {Kind}");
+        }
+    }
 
     public override string ToString()
     {
@@ -162,8 +236,10 @@ public sealed class PlatformAvailability
                 var assembly = (AssemblyModel)LimitationSource;
                 return $"The assembly {assembly.Name} has limited platform support. {PlatformList}";
             case PlatformAvailabilityKind.ApiLimited:
-                var api = (ApiModel)LimitationSource;
-                return $"The API {api.GetFullName()} has limited platform support. {PlatformList}";
+                var api = (ApiModel?)LimitationSource;
+                return api is null
+                    ? $"The API has limited platform support. {PlatformList}"
+                    : $"The API {api.Value.GetFullName()} has limited platform support. {PlatformList}";
             default:
                 throw new Exception($"Unexpected kind: {Kind}");
         }
